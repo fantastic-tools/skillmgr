@@ -215,10 +215,8 @@ fn delete_plugin_files(name: &str) -> Result<(), String> {
     if !valid_plugin_name(name) {
         return Err("invalid plugin name".into());
     }
-    let base = format!("{}/skill-library/plugins/{}", home(), name);
-    if std::path::Path::new(&base).exists() {
-        std::fs::remove_dir_all(&base).map_err(|e| e.to_string())?;
-    }
+    // Unregister only: remove the marketplace entry. The plugin directory and
+    // ALL its skills are intentionally left on disk (we never delete skills).
     let mp = marketplace_path();
     if let Ok(txt) = std::fs::read_to_string(&mp) {
         if let Ok(mut v) = serde_json::from_str::<Value>(&txt) {
@@ -523,7 +521,7 @@ fn ui(f: &mut Frame, app: &mut App) {
                     Span::raw(" ?"),
                 ]),
                 Line::from(Span::styled(
-                    format!("  removes ~/skill-library/plugins/{name} and its skills"),
+                    "  unregisters it from the marketplace · skill files are kept on disk".to_string(),
                     Style::new().fg(th.off),
                 )),
                 Line::raw(""),
