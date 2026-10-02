@@ -23,6 +23,14 @@ struct GSkill {
     archived: bool,
 }
 
+#[derive(Default)]
+struct PlugForm {
+    name: String,
+    desc: String,
+    focus: usize, // 0 = name, 1 = description
+    err: String,
+}
+
 fn home() -> String {
     std::env::var("HOME").unwrap_or_else(|_| "/root".into())
 }
@@ -161,6 +169,68 @@ fn set_archived(name: &str, archived: bool) -> Result<(), String> {
     std::fs::rename(&from, &to).map_err(|e| e.to_string())
 }
 
+fn marketplace_path() -> String {
+    format!("{}/skill-library/.claude-plugin/marketplace.json", home())
+}
+
+fn valid_plugin_name(n: &str) -> bool {
+    !n.is_empty()
+        && n.chars().next().map(|c| c != '-').unwrap_or(false)
+        && n.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+fn create_plugin_files(name: &str, desc: &str) -> Result<(), String> {
+    if !valid_plugin_name(name) {
+        return Err("name must be lowercase letters, digits, hyphens".into());
+    }
+    let base = format!("{}/skill-library/plugins/{}", home(), name);
+    if std::path::Path::new(&base).exists() {
+        return Err(format!("plugin '{name}' already exists"));
+    }
+    std::fs::create_dir_all(format!("{base}/.claude-plugin")).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(format!("{base}/skills")).map_err(|e| e.to_string())?;
+    let pj = serde_json::json!({
+        "name": name, "version": "0.1.0", "description": desc,
+        "author": { "name": "mrdoodles" }, "license": "MIT", "keywords": []
+    });
+    std::fs::write(
+        format!("{base}/.claude-plugin/plugin.json"),
+        serde_json::to_string_pretty(&pj).map_err(|e| e.to_string())? + "\n",
+    )
+    .map_err(|e| e.to_string())?;
+
+    let mp = marketplace_path();
+    let txt = std::fs::read_to_string(&mp).map_err(|e| e.to_string())?;
+    let mut v: Value = serde_json::from_str(&txt).map_err(|e| e.to_string())?;
+    let arr = v.get_mut("plugins").and_then(|p| p.as_array_mut()).ok_or("marketplace has no plugins array")?;
+    if arr.iter().any(|p| p.get("name").and_then(|n| n.as_str()) == Some(name)) {
+        return Err("already listed in marketplace".into());
+    }
+    arr.push(serde_json::json!({ "name": name, "source": format!("./plugins/{name}"), "description": desc }));
+    std::fs::write(&mp, serde_json::to_string_pretty(&v).map_err(|e| e.to_string())? + "\n").map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn delete_plugin_files(name: &str) -> Result<(), String> {
+    if !valid_plugin_name(name) {
+        return Err("invalid plugin name".into());
+    }
+    // Unregister only: remove the marketplace entry. The plugin directory and
+    // ALL its skills are intentionally left on disk (we never delete skills).
+    let mp = marketplace_path();
+    if let Ok(txt) = std::fs::read_to_string(&mp) {
+        if let Ok(mut v) = serde_json::from_str::<Value>(&txt) {
+            if let Some(arr) = v.get_mut("plugins").and_then(|p| p.as_array_mut()) {
+                arr.retain(|p| p.get("name").and_then(|n| n.as_str()) != Some(name));
+            }
+            if let Ok(out) = serde_json::to_string_pretty(&v) {
+                let _ = std::fs::write(&mp, out + "\n");
+            }
+        }
+    }
+    Ok(())
+}
+
 struct Theme {
     name: &'static str,
     fg: Color,
@@ -196,6 +266,8 @@ struct App {
     theme: usize,
     msg: String,
     popup: Option<String>,
+    new_form: Option<PlugForm>,
+    confirm_delete: Option<(String, String)>, // (key, name)
     quit: bool,
 }
 
@@ -223,8 +295,10 @@ impl App {
             gstate,
             focus: Focus::Plugins,
             theme,
-            msg: "tab: focus · j/k: scroll · space: toggle · t: theme · r: reload · q: quit".into(),
+            msg: "tab focus · j/k scroll · space toggle · n new · d delete · t theme · r reload · q quit".into(),
             popup: None,
+            new_form: None,
+            confirm_delete: None,
             quit: false,
         })
     }
@@ -327,6 +401,50 @@ impl App {
         self.plugins.iter().any(|p| p.skills.iter().any(|s| s == name))
     }
 
+    fn submit_new_plugin(&mut self) {
+        let (name, desc) = match self.new_form.as_ref() {
+            Some(f) => (f.name.trim().to_string(), f.desc.trim().to_string()),
+            None => return,
+        };
+        if name.is_empty() {
+            if let Some(f) = self.new_form.as_mut() {
+                f.err = "name required".into();
+            }
+            return;
+        }
+        match create_plugin_files(&name, &desc) {
+            Ok(_) => {
+                if let Some(obj) = self.settings.get_mut("enabledPlugins").and_then(|e| e.as_object_mut()) {
+                    obj.insert(format!("{name}@skill-library"), Value::Bool(false));
+                }
+                let _ = save_settings(&self.settings);
+                self.new_form = None;
+                self.reload();
+                self.msg = format!("created plugin {name} (disabled)");
+            }
+            Err(e) => {
+                if let Some(f) = self.new_form.as_mut() {
+                    f.err = e;
+                }
+            }
+        }
+    }
+
+    fn delete_confirmed(&mut self) {
+        let Some((key, name)) = self.confirm_delete.take() else { return };
+        match delete_plugin_files(&name) {
+            Ok(_) => {
+                if let Some(obj) = self.settings.get_mut("enabledPlugins").and_then(|e| e.as_object_mut()) {
+                    obj.remove(&key);
+                }
+                let _ = save_settings(&self.settings);
+                self.reload();
+                self.msg = format!("deleted plugin {name}");
+            }
+            Err(e) => self.popup = Some(format!("delete failed: {e}")),
+        }
+    }
+
     fn enabled_skills(&self) -> Vec<String> {
         let mut v: Vec<String> = self
             .plugins
@@ -387,6 +505,60 @@ fn ui(f: &mut Frame, app: &mut App) {
                 Line::from(Span::styled("  press any key to dismiss", Style::new().fg(th.off))),
             ])
             .block(Block::default().borders(Borders::ALL).title(" notice ").border_style(Style::new().fg(th.accent))),
+            area,
+        );
+    }
+
+    if let Some((_, name)) = &app.confirm_delete {
+        let area = centered(f.area(), 68, 9);
+        f.render_widget(Clear, area);
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::raw(""),
+                Line::from(vec![
+                    Span::raw("  Delete plugin "),
+                    Span::styled(name.clone(), Style::new().fg(th.accent).bold()),
+                    Span::raw(" ?"),
+                ]),
+                Line::from(Span::styled(
+                    "  unregisters it from the marketplace · skill files are kept on disk".to_string(),
+                    Style::new().fg(th.off),
+                )),
+                Line::raw(""),
+                Line::from(vec![
+                    Span::raw("      "),
+                    Span::styled("y", Style::new().fg(th.on).bold()),
+                    Span::raw(" = yes    "),
+                    Span::styled("n", Style::new().fg(th.off).bold()),
+                    Span::raw("/Esc = no"),
+                ]),
+            ])
+            .block(Block::default().borders(Borders::ALL).title(" confirm delete ").border_style(Style::new().fg(Color::Red))),
+            area,
+        );
+    }
+
+    if let Some(fm) = &app.new_form {
+        let area = centered(f.area(), 68, 11);
+        f.render_widget(Clear, area);
+        let mut lines = vec![Line::raw("")];
+        let fields = [("Name (lowercase, hyphens)", &fm.name), ("Description", &fm.desc)];
+        for (i, (label, val)) in fields.iter().enumerate() {
+            let m = if fm.focus == i { "› " } else { "  " };
+            let vs = if fm.focus == i { Style::new().reversed() } else { Style::new() };
+            lines.push(Line::from(vec![
+                Span::raw(m),
+                Span::styled(format!("{:<28}", label), Style::new().fg(th.accent)),
+                Span::styled((*val).clone(), vs),
+            ]));
+        }
+        lines.push(Line::raw(""));
+        if !fm.err.is_empty() {
+            lines.push(Line::from(Span::styled(format!("  {}", fm.err), Style::new().fg(Color::Red))));
+        }
+        lines.push(Line::from(Span::styled("  Enter create · Tab/↑↓ move · Esc cancel", Style::new().fg(th.off))));
+        f.render_widget(
+            Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" new plugin ").border_style(Style::new().fg(th.accent))),
             area,
         );
     }
@@ -513,6 +685,40 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
             app.popup = None;
             continue;
         }
+        if app.confirm_delete.is_some() {
+            match k.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => app.delete_confirmed(),
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    app.confirm_delete = None;
+                    app.msg = "cancelled".into();
+                }
+                _ => {}
+            }
+            continue;
+        }
+        if app.new_form.is_some() {
+            match k.code {
+                KeyCode::Esc => app.new_form = None,
+                KeyCode::Enter => app.submit_new_plugin(),
+                _ => {
+                    if let Some(fm) = app.new_form.as_mut() {
+                        match k.code {
+                            KeyCode::Tab | KeyCode::Down | KeyCode::BackTab | KeyCode::Up => {
+                                fm.focus = (fm.focus + 1) % 2
+                            }
+                            KeyCode::Backspace => {
+                                if fm.focus == 0 { fm.name.pop(); } else { fm.desc.pop(); }
+                            }
+                            KeyCode::Char(c) => {
+                                if fm.focus == 0 { fm.name.push(c); } else { fm.desc.push(c); }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            continue;
+        }
         match k.code {
             KeyCode::Char('q') => app.quit = true,
             KeyCode::Tab => app.cycle_focus(),
@@ -524,6 +730,27 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
                 save_theme_name(themes()[app.theme].name);
             }
             KeyCode::Char('r') => app.reload(),
+            KeyCode::Char('n') => {
+                if app.focus == Focus::Plugins {
+                    app.new_form = Some(PlugForm::default());
+                }
+            }
+            KeyCode::Char('d') => {
+                if app.focus == Focus::Plugins {
+                    let sel = app
+                        .pstate
+                        .selected()
+                        .and_then(|i| app.plugins.get(i))
+                        .map(|p| (p.key.clone(), p.name.clone()));
+                    if let Some((key, name)) = sel {
+                        if key.ends_with("@skill-library") {
+                            app.confirm_delete = Some((key, name));
+                        } else {
+                            app.popup = Some("only skill-library plugins can be deleted here".into());
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }

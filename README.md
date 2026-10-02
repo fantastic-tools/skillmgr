@@ -56,6 +56,8 @@ Expects Claude Code's `~/.claude/settings.json`, and (for plugin skills) your ma
 | `j` / `k` (or ↓/↑) | scroll the focused pane |
 | `space` / `Enter` | toggle: install/uninstall a plugin, or archive/unarchive a global skill |
 | `a` | (global-skills pane) archive / unarchive |
+| `n` | (plugins pane) create a new plugin |
+| `d` | (plugins pane) delete the selected plugin — asks **y / N** to confirm |
 | `t` | cycle colour theme (persisted) |
 | `r` | reload from disk |
 | `q` | quit |
@@ -64,6 +66,18 @@ Expects Claude Code's `~/.claude/settings.json`, and (for plugin skills) your ma
 
 ### Plugins
 The middle pane lists every plugin from your marketplace with its enabled state (`▣` enabled/bold, `☐` disabled) and skill count. `space` installs/uninstalls it. The top strip summarises **enabled plugins** (left) and the **skills they provide** (right); the lower pane shows the **selected plugin's skills**.
+
+### Creating & deleting plugins
+From the Plugins pane:
+
+- **`n`** opens a form (name + description) and scaffolds a new plugin under
+  `~/skill-library/plugins/<name>/` (a `plugin.json` and an empty `skills/`), adds it
+  to the marketplace, and lists it disabled — ready to populate and enable.
+- **`d`** deletes the selected plugin after a **y / N** confirm. Deleting a plugin
+  **only unregisters it** — it removes the plugin's marketplace entry and disables it.
+  **It never deletes the skills that were registered with it.** Skills are shared
+  across plugins (and with the global skills), so the skill files are always left on
+  disk. Only plugins from your `skill-library` marketplace can be deleted.
 
 ### Global skills
 Lists the skills under `~/.claude/skills`. `space`/`a` **archives** the selected skill — moving its directory to `~/.skillmgr/` (created on first use, adjacent to `~/.claude`) — or **unarchives** it by moving it back.
@@ -77,6 +91,8 @@ A skill that **belongs to any plugin** is considered *in use* and cannot be arch
 | `~/.claude/settings.json` | writes **only** the `enabledPlugins` key; key order and all other settings are preserved |
 | `~/.claude/skills/` ⇄ `~/.skillmgr/` | archiving/unarchiving moves a skill **directory** between the two (reversible) |
 | `~/.skillmgr/config.json` | stores your chosen theme |
+| `~/skill-library/.claude-plugin/marketplace.json` | create adds an entry; delete removes it |
+| `~/skill-library/plugins/<name>/` | create scaffolds it; **delete never removes skills** |
 
 Note: `~/.claude/skills` is typically a git repo — archiving moves a tracked directory out of it, which git will show as a deletion. Commit that when and how you like.
 
