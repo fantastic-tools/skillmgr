@@ -1,22 +1,27 @@
-//! skillmgr — a TUI to manage Claude Code plugins (collections of skills).
-//! Source of truth (no CLI): enabledPlugins in ~/.claude/settings.json;
-//! plugin list/descriptions + skills from ~/skill-library (marketplace + plugins/<name>/skills).
-//! Release 1: install/uninstall plugins; browse each plugin's skills; colour schemes.
-//! Global skills (~/.claude/skills) are OUT OF SCOPE for r1.
+//! skillmgr — a TUI to manage Claude Code plugins & global skills.
+//! No CLI needed:
+//!   - plugins: enabledPlugins in ~/.claude/settings.json (+ ~/skill-library marketplace/skills)
+//!   - global skills: directories under ~/.claude/skills (archived to ~/.claude/skills-archive)
+//! Two views (Tab): Plugins (install/uninstall) · Global skills (archive/unarchive).
 
 use anyhow::{Context, Result};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use serde_json::Value;
 use std::time::Duration;
 
 struct Plug {
-    key: String,       // "rust@skill-library"
-    name: String,      // "rust"
+    key: String,
+    name: String,
     desc: String,
     enabled: bool,
     skills: Vec<String>,
+}
+
+struct GSkill {
+    name: String,
+    archived: bool,
 }
 
 fn home() -> String {
@@ -25,13 +30,18 @@ fn home() -> String {
 fn settings_path() -> String {
     format!("{}/.claude/settings.json", home())
 }
+fn skills_dir() -> String {
+    format!("{}/.claude/skills", home())
+}
+fn archive_dir() -> String {
+    format!("{}/.skillmgr", home())
+}
 
 fn load_settings() -> Result<Value> {
     let p = settings_path();
     let txt = std::fs::read_to_string(&p).with_context(|| format!("reading {p}"))?;
     Ok(serde_json::from_str(&txt)?)
 }
-
 fn save_settings(v: &Value) -> Result<()> {
     let p = settings_path();
     std::fs::write(&p, serde_json::to_string_pretty(v)? + "\n").with_context(|| format!("writing {p}"))?;
@@ -91,6 +101,45 @@ fn load_plugins(settings: &Value) -> Vec<Plug> {
     out
 }
 
+fn dirs_in(path: &str) -> Vec<String> {
+    let mut v = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(path) {
+        for e in rd.flatten() {
+            if e.path().is_dir() {
+                if let Some(n) = e.file_name().to_str() {
+                    if !n.starts_with('.') && n != "synced" {
+                        v.push(n.to_string());
+                    }
+                }
+            }
+        }
+    }
+    v
+}
+
+fn load_global_skills() -> Vec<GSkill> {
+    let mut out: Vec<GSkill> = Vec::new();
+    for n in dirs_in(&skills_dir()) {
+        out.push(GSkill { name: n, archived: false });
+    }
+    for n in dirs_in(&archive_dir()) {
+        out.push(GSkill { name: n, archived: true });
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// Move a global skill between the active skills dir and the archive dir.
+fn set_archived(name: &str, archived: bool) -> Result<(), String> {
+    let active = format!("{}/{}", skills_dir(), name);
+    let arch = format!("{}/{}", archive_dir(), name);
+    let (from, to) = if archived { (active, arch) } else { (arch, active) };
+    if archived {
+        std::fs::create_dir_all(archive_dir()).map_err(|e| e.to_string())?;
+    }
+    std::fs::rename(&from, &to).map_err(|e| e.to_string())
+}
+
 struct Theme {
     name: &'static str,
     fg: Color,
@@ -109,12 +158,22 @@ fn themes() -> Vec<Theme> {
     ]
 }
 
+#[derive(PartialEq, Clone, Copy)]
+enum View {
+    Plugins,
+    Skills,
+}
+
 struct App {
     settings: Value,
     plugins: Vec<Plug>,
+    gskills: Vec<GSkill>,
     pstate: ListState,
+    gstate: ListState,
+    view: View,
     theme: usize,
     msg: String,
+    popup: Option<String>,
     quit: bool,
 }
 
@@ -122,14 +181,21 @@ impl App {
     fn new() -> Result<Self> {
         let settings = load_settings()?;
         let plugins = load_plugins(&settings);
+        let gskills = load_global_skills();
         let mut pstate = ListState::default();
         pstate.select(if plugins.is_empty() { None } else { Some(0) });
+        let mut gstate = ListState::default();
+        gstate.select(if gskills.is_empty() { None } else { Some(0) });
         Ok(Self {
             settings,
             plugins,
+            gskills,
             pstate,
+            gstate,
+            view: View::Plugins,
             theme: 0,
-            msg: "space: install/uninstall · t: theme · r: reload · q: quit".into(),
+            msg: "tab: view · space: toggle · t: theme · r: reload · q: quit".into(),
+            popup: None,
             quit: false,
         })
     }
@@ -139,19 +205,30 @@ impl App {
             self.settings = s;
             self.plugins = load_plugins(&self.settings);
         }
+        self.gskills = load_global_skills();
         self.msg = "reloaded".into();
     }
 
     fn mv(&mut self, d: i64) {
-        if self.plugins.is_empty() {
+        let (len, st) = match self.view {
+            View::Plugins => (self.plugins.len(), &mut self.pstate),
+            View::Skills => (self.gskills.len(), &mut self.gstate),
+        };
+        if len == 0 {
             return;
         }
-        let cur = self.pstate.selected().unwrap_or(0) as i64;
-        self.pstate
-            .select(Some((cur + d).clamp(0, self.plugins.len() as i64 - 1) as usize));
+        let cur = st.selected().unwrap_or(0) as i64;
+        st.select(Some((cur + d).clamp(0, len as i64 - 1) as usize));
     }
 
     fn toggle(&mut self) {
+        match self.view {
+            View::Plugins => self.toggle_plugin(),
+            View::Skills => self.toggle_skill(),
+        }
+    }
+
+    fn toggle_plugin(&mut self) {
         let Some(i) = self.pstate.selected() else { return };
         let Some(p) = self.plugins.get_mut(i) else { return };
         let newval = !p.enabled;
@@ -172,6 +249,35 @@ impl App {
         }
     }
 
+    fn toggle_skill(&mut self) {
+        let Some(i) = self.gstate.selected() else { return };
+        let (name, archived) = match self.gskills.get(i) {
+            Some(g) => (g.name.clone(), g.archived),
+            None => return,
+        };
+        let target = !archived;
+        if target && self.skill_in_use(&name) {
+            self.popup = Some(format!("{name} cannot be archived because it is in use."));
+            return;
+        }
+        match set_archived(&name, target) {
+            Ok(_) => {
+                self.gskills = load_global_skills();
+                self.msg = format!("{} {}", if target { "archived" } else { "unarchived" }, name);
+            }
+            Err(e) => self.msg = format!("{} failed: {e}", if target { "archive" } else { "unarchive" }),
+        }
+    }
+
+    /// "In use" (first definition — confirm): the skill is provided by a currently
+    /// ENABLED plugin (same name), so it is active via that plugin.
+    fn skill_in_use(&self, name: &str) -> bool {
+        self.plugins
+            .iter()
+            .filter(|p| p.enabled)
+            .any(|p| p.skills.iter().any(|s| s == name))
+    }
+
     fn enabled_skills(&self) -> Vec<String> {
         let mut v: Vec<String> = self
             .plugins
@@ -190,15 +296,68 @@ fn ui(f: &mut Frame, app: &mut App) {
     let base = Style::new().fg(th.fg).bg(th.bg);
     f.render_widget(Block::default().style(base), f.area());
 
-    let rows = Layout::vertical([
-        Constraint::Length(8), // top summary
-        Constraint::Min(6),    // plugins
-        Constraint::Min(6),    // selected plugin's skills
+    let outer = Layout::vertical([
+        Constraint::Length(1), // tab bar
+        Constraint::Min(1),    // body
         Constraint::Length(1), // help
     ])
     .split(f.area());
 
-    // top: enabled plugins (left, small) | enabled skills (right, large)
+    // tab bar
+    let (pt, st) = match app.view {
+        View::Plugins => (Style::new().fg(th.bg).bg(th.accent).bold(), Style::new().fg(th.off)),
+        View::Skills => (Style::new().fg(th.off), Style::new().fg(th.bg).bg(th.accent).bold()),
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" Plugins ", pt),
+            Span::raw("  "),
+            Span::styled(" Global skills ", st),
+            Span::styled("   (Tab)", Style::new().fg(th.off)),
+        ]))
+        .style(base),
+        outer[0],
+    );
+
+    match app.view {
+        View::Plugins => plugins_view(f, app, th, outer[1]),
+        View::Skills => skills_view(f, app, th, outer[1]),
+    }
+
+    let help = Line::from(vec![
+        Span::styled(format!(" [{}] ", themes()[app.theme].name), Style::new().fg(th.accent).bold()),
+        Span::styled(app.msg.clone(), Style::new().fg(th.fg)),
+    ]);
+    f.render_widget(Paragraph::new(help).style(base), outer[2]);
+
+    if let Some(m) = &app.popup {
+        let area = centered(f.area(), 64, 7);
+        f.render_widget(Clear, area);
+        let body = Paragraph::new(vec![
+            Line::raw(""),
+            Line::from(Span::styled(format!("  {m}"), Style::new().fg(th.fg))),
+            Line::raw(""),
+            Line::from(Span::styled("  press any key to dismiss", Style::new().fg(th.off))),
+        ])
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" notice ")
+                .border_style(Style::new().fg(th.accent)),
+        );
+        f.render_widget(body, area);
+    }
+}
+
+fn centered(area: Rect, w: u16, h: u16) -> Rect {
+    let w = w.min(area.width);
+    let h = h.min(area.height);
+    Rect { x: area.x + (area.width - w) / 2, y: area.y + (area.height - h) / 2, width: w, height: h }
+}
+
+fn plugins_view(f: &mut Frame, app: &mut App, th: &Theme, area: Rect) {
+    let rows = Layout::vertical([Constraint::Length(8), Constraint::Min(6), Constraint::Min(6)]).split(area);
+
     let top = Layout::horizontal([Constraint::Percentage(30), Constraint::Percentage(70)]).split(rows[0]);
     let en_plugs: Vec<ListItem> = app
         .plugins
@@ -207,15 +366,10 @@ fn ui(f: &mut Frame, app: &mut App) {
         .map(|p| ListItem::new(p.name.clone()).style(Style::new().fg(th.on).bold()))
         .collect();
     f.render_widget(List::new(en_plugs).block(panel(th, " enabled plugins ", th.accent)), top[0]);
-
     let es = app.enabled_skills();
     let en_skills: Vec<ListItem> = es.iter().map(|s| ListItem::new(s.clone()).style(Style::new().fg(th.on))).collect();
-    f.render_widget(
-        List::new(en_skills).block(panel(th, &format!(" enabled skills ({}) ", es.len()), th.accent)),
-        top[1],
-    );
+    f.render_widget(List::new(en_skills).block(panel(th, &format!(" enabled skills ({}) ", es.len()), th.accent)), top[1]);
 
-    // middle: plugins (the toggle list)
     let pitems: Vec<ListItem> = app
         .plugins
         .iter()
@@ -230,13 +384,15 @@ fn ui(f: &mut Frame, app: &mut App) {
             ]))
         })
         .collect();
-    let plist = List::new(pitems)
-        .block(panel(th, " plugins  (space = install/uninstall) ", th.accent))
-        .highlight_style(Style::new().bg(th.accent).fg(th.bg))
-        .highlight_symbol("› ");
-    f.render_stateful_widget(plist, rows[1], &mut app.pstate);
+    f.render_stateful_widget(
+        List::new(pitems)
+            .block(panel(th, " plugins  (space = install/uninstall) ", th.accent))
+            .highlight_style(Style::new().bg(th.accent).fg(th.bg))
+            .highlight_symbol("› "),
+        rows[1],
+        &mut app.pstate,
+    );
 
-    // lower: skills of the selected plugin
     let (title, sitems) = match app.pstate.selected().and_then(|i| app.plugins.get(i)) {
         Some(p) => {
             let items: Vec<ListItem> = if p.skills.is_empty() {
@@ -257,12 +413,38 @@ fn ui(f: &mut Frame, app: &mut App) {
         None => (" skills ".to_string(), vec![]),
     };
     f.render_widget(List::new(sitems).block(panel(th, &title, th.off)), rows[2]);
+}
 
-    let help = Line::from(vec![
-        Span::styled(format!(" [{}] ", themes()[app.theme].name), Style::new().fg(th.accent).bold()),
-        Span::styled(app.msg.clone(), Style::new().fg(th.fg)),
-    ]);
-    f.render_widget(Paragraph::new(help).style(base), rows[3]);
+fn skills_view(f: &mut Frame, app: &mut App, th: &Theme, area: Rect) {
+    let active = app.gskills.iter().filter(|g| !g.archived).count();
+    let archived = app.gskills.len() - active;
+    let items: Vec<ListItem> = app
+        .gskills
+        .iter()
+        .map(|g| {
+            let (tag, style) = if g.archived {
+                ("[archived] ", Style::new().fg(th.off))
+            } else {
+                ("[active]   ", Style::new().fg(th.on))
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(tag, style),
+                Span::styled(g.name.clone(), Style::new().fg(if g.archived { th.off } else { th.fg })),
+            ]))
+        })
+        .collect();
+    f.render_stateful_widget(
+        List::new(items)
+            .block(panel(
+                th,
+                &format!(" global skills — {active} active · {archived} archived   (space = archive/unarchive) "),
+                th.accent,
+            ))
+            .highlight_style(Style::new().bg(th.accent).fg(th.bg))
+            .highlight_symbol("› "),
+        area,
+        &mut app.gstate,
+    );
 }
 
 fn panel(th: &Theme, title: &str, border: Color) -> Block<'static> {
@@ -300,11 +482,21 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
         if k.kind != KeyEventKind::Press {
             continue;
         }
+        if app.popup.is_some() {
+            app.popup = None;
+            continue;
+        }
         match k.code {
             KeyCode::Char('q') => app.quit = true,
+            KeyCode::Tab => {
+                app.view = match app.view {
+                    View::Plugins => View::Skills,
+                    View::Skills => View::Plugins,
+                }
+            }
             KeyCode::Char('j') | KeyCode::Down => app.mv(1),
             KeyCode::Char('k') | KeyCode::Up => app.mv(-1),
-            KeyCode::Char(' ') | KeyCode::Enter => app.toggle(),
+            KeyCode::Char(' ') | KeyCode::Enter | KeyCode::Char('a') => app.toggle(),
             KeyCode::Char('t') => app.theme = (app.theme + 1) % nthemes,
             KeyCode::Char('r') => app.reload(),
             _ => {}
