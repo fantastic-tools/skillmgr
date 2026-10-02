@@ -1,50 +1,97 @@
 # skillmgr
 
-A TUI to manage **Claude Code plugins** (collections of skills) — enable/disable
-them without the CLI, with selectable colour schemes. Rust + ratatui, same spirit
-as [podmangr](https://github.com/podmangr/podmangr).
+A fast, vim-keyed **TUI for managing Claude Code plugins and global skills** — no CLI required. Rust + [ratatui](https://ratatui.rs).
 
-## Model
-- A **plugin** is a collection of skills (e.g. `rust`, `web-development`). Installing
-  a plugin enables its whole skill collection.
-- **Source of truth (no CLI needed):** `enabledPlugins` in `~/.claude/settings.json`.
-  Plugin list/descriptions and each plugin's skills come from `~/skill-library`
-  (`.claude-plugin/marketplace.json` and `plugins/<name>/skills/`).
-- **Global skills** (`~/.claude/skills`) are **out of scope for release 1** — not touched.
+skillmgr reads and writes the real Claude Code configuration, so what you toggle takes effect immediately:
+
+- **Install / uninstall plugins** (collections of skills) — flips `enabledPlugins` in `~/.claude/settings.json`.
+- **Browse the skills** inside each plugin.
+- **Archive / unarchive global skills** (directories under `~/.claude/skills`).
+- **Colour themes**, remembered between runs.
+
+## The model (worth knowing)
+
+- A **plugin** is a collection of skills from a marketplace. Installing it enables its whole skill collection. (Plugins can also ship slash-commands, subagents, hooks and MCP servers; the `skill-library` plugins happen to be skill-only.)
+- **Global skills** are directories under `~/.claude/skills`, active simply by being present.
+- The only thing with a true on/off switch is a **plugin** (the `enabledPlugins` boolean). Skills ride along with their plugin, or exist by presence.
+
+See `~/Documents/Claude/how-plugins-work.odt` for the full write-up.
 
 ## Layout
-- **Top-left:** enabled plugins.
-- **Top-right:** enabled skills — the skills contained in all installed plugins.
-- **Middle:** every plugin; `space` installs/uninstalls. Enabled = bold/green `▣`.
-- **Lower:** the selected plugin's skills (browse a collection's contents).
+
+```
+ Plugins | Global skills                         (Tab cycles panes)
+┌ enabled plugins ─┐ ┌ enabled skills (12) ───────────────────────┐
+│ rust             │ │ accessibility  hurl  react-2026  tailwind… │
+│ web-development   │ └─────────────────────────────────────────────┘
+└───────────────────┘
+┌ plugins  (space = install/uninstall) ──────────────────────────┐
+│ › ▣ rust              [21] Expert Rust patterns: ownership…     │
+│   ☐ go                [12] Idiomatic Go: modules, errors…       │
+└──────────────────────────────────────────────────────────────────┘
+┌ skills in rust (21) ────────────────────────────────────────────┐
+│ • egui                                                           │
+│ • rust-async                                                     │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+Three panes, cycled with **Tab**: the **plugins** list, the selected plugin's **skills**, and the **global skills** view. The focused pane gets an accent border and a highlighted row; `j`/`k` scroll it.
 
 ## Build & run
+
+Requires a stable Rust toolchain.
+
 ```bash
 cargo run              # dev
 cargo build --release  # ./target/release/skillmgr
 ```
-Writes only the `enabledPlugins` key in `settings.json` (preserves order and every
-other setting).
+
+Expects Claude Code's `~/.claude/settings.json`, and (for plugin skills) your marketplace at `~/skill-library`.
 
 ## Keys
+
 | Key | Action |
 |-----|--------|
-| `j` / `k` (or ↓/↑) | move plugin selection |
-| `space` / `Enter` | install / uninstall the selected plugin |
-| `t` | cycle colour scheme (dark / light / solarized / gruvbox) |
-| `r` | reload from settings.json |
+| `Tab` | cycle focus: Plugins → that plugin's Skills → Global skills |
+| `j` / `k` (or ↓/↑) | scroll the focused pane |
+| `space` / `Enter` | toggle: install/uninstall a plugin, or archive/unarchive a global skill |
+| `a` | (global-skills pane) archive / unarchive |
+| `t` | cycle colour theme (persisted) |
+| `r` | reload from disk |
 | `q` | quit |
 
-## Status (r1)
-- [x] Read plugins + enabled state from `settings.json` / marketplace
-- [x] Install / uninstall plugins (writes `enabledPlugins`, order preserved)
-- [x] Top summary (enabled plugins | enabled skills) + per-plugin skill browser
-- [x] Colour schemes (`t`)
+## Views
+
+### Plugins
+The middle pane lists every plugin from your marketplace with its enabled state (`▣` enabled/bold, `☐` disabled) and skill count. `space` installs/uninstalls it. The top strip summarises **enabled plugins** (left) and the **skills they provide** (right); the lower pane shows the **selected plugin's skills**.
+
+### Global skills
+Lists the skills under `~/.claude/skills`. `space`/`a` **archives** the selected skill — moving its directory to `~/.skillmgr/` (created on first use, adjacent to `~/.claude`) — or **unarchives** it by moving it back.
+
+A skill that **belongs to any plugin** is considered *in use* and cannot be archived; skillmgr shows a popup: *"&lt;skill&gt; cannot be archived because it is in use."*
+
+## What it touches (safety)
+
+| Path | How |
+|------|-----|
+| `~/.claude/settings.json` | writes **only** the `enabledPlugins` key; key order and all other settings are preserved |
+| `~/.claude/skills/` ⇄ `~/.skillmgr/` | archiving/unarchiving moves a skill **directory** between the two (reversible) |
+| `~/.skillmgr/config.json` | stores your chosen theme |
+
+Note: `~/.claude/skills` is typically a git repo — archiving moves a tracked directory out of it, which git will show as a deletion. Commit that when and how you like.
+
+## Themes
+
+`dark`, `light`, `solarized`, `gruvbox` — cycle with `t`; your choice is saved to `~/.skillmgr/config.json` and restored next launch.
 
 ## Roadmap
-- [ ] Mouse / clickable buttons (r1 is keyboard-first, vim keys)
-- [ ] Richer "button" rendering (per-item borders) matching the original sketch
-- [ ] `/` filter/search across plugins & skills
-- [ ] Per-skill enable/disable *within* a plugin — needs a mechanism, since Claude's
-      `enabledPlugins` is plugin-level only (not natively per-skill)
-- [ ] Separate view to display/manage the default (global) skills
+
+- [ ] Mouse / clickable buttons
+- [ ] `/` filter & search across plugins and skills
+- [ ] Richer per-item "button" borders
+- [ ] Project-level skills (`.claude/skills` in a repo)
+- [ ] Per-skill enable/disable *within* a plugin (needs a mechanism — not native to Claude Code)
+
+## License
+
+See [LICENSE](LICENSE).
