@@ -269,13 +269,10 @@ impl App {
         }
     }
 
-    /// "In use" (first definition — confirm): the skill is provided by a currently
-    /// ENABLED plugin (same name), so it is active via that plugin.
+    /// "In use" = the skill (by name) is used in a plugin — i.e. it belongs to
+    /// any plugin's skill collection (enabled or not). Such skills can't be archived.
     fn skill_in_use(&self, name: &str) -> bool {
-        self.plugins
-            .iter()
-            .filter(|p| p.enabled)
-            .any(|p| p.skills.iter().any(|s| s == name))
+        self.plugins.iter().any(|p| p.skills.iter().any(|s| s == name))
     }
 
     fn enabled_skills(&self) -> Vec<String> {
